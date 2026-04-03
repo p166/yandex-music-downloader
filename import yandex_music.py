@@ -133,25 +133,31 @@ def download_liked(session_id: str, download_dir: str, hq: bool = False):
     downloaded_index_path = os.path.join(download_dir, ".downloaded_ids.txt")
     downloaded_ids = load_downloaded_ids(downloaded_index_path)
     ids_lock = threading.Lock()
+    failed_tracks: list[tuple[int, object]] = []
+    failed_lock = threading.Lock()
 
-    def process_track(i: int, track_short) -> None:
+    def process_track(i: int, track_short, total: int, is_retry: bool = False) -> None:
+        label = f"[retry {i}]" if is_retry else f"[{i}/{total}]"
         try:
             track = track_short.fetch_track()
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            print(f"[{i}/{total_tracks}] Ошибка получения трека: {e}")
+            print(f"{label} Ошибка получения трека: {e}")
+            if not is_retry:
+                with failed_lock:
+                    failed_tracks.append((i, track_short))
             return
 
         if track is None:
-            print(f"[{i}/{total_tracks}] Невозможно загрузить трек")
+            print(f"{label} Невозможно загрузить трек")
             return
 
         track_id = str(getattr(track, "id", ""))
         if track_id:
             with ids_lock:
                 if track_id in downloaded_ids:
-                    print(f"[{i}/{total_tracks}] Уже скачан по ID: {track_id}")
+                    print(f"{label} Уже скачан по ID: {track_id}")
                     return
 
         title = track.title or "Unknown title"
@@ -160,7 +166,7 @@ def download_liked(session_id: str, download_dir: str, hq: bool = False):
         fpath = os.path.join(download_dir, fname)
 
         if os.path.exists(fpath):
-            print(f"[{i}/{total_tracks}] Уже есть: {fpath}")
+            print(f"{label} Уже есть: {fpath}")
             if track_id:
                 with ids_lock:
                     if track_id not in downloaded_ids:
@@ -168,19 +174,22 @@ def download_liked(session_id: str, download_dir: str, hq: bool = False):
                         downloaded_ids.add(track_id)
             return
 
-        print(f"[{i}/{total_tracks}] Скачиваю: {artists} - {title}")
+        print(f"{label} Скачиваю: {artists} - {title}")
         try:
             track.download(fpath, bitrate_in_kbps=320 if hq else 192)
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            print(f"[{i}/{total_tracks}] Ошибка скачивания: {e}")
+            print(f"{label} Ошибка скачивания: {e}")
+            if not is_retry:
+                with failed_lock:
+                    failed_tracks.append((i, track_short))
             return
 
         try:
             write_id3_tags(fpath, track)
         except Exception as e:
-            print(f"[{i}/{total_tracks}] Ошибка записи тегов: {e}")
+            print(f"{label} Ошибка записи тегов: {e}")
 
         if track_id:
             with ids_lock:
@@ -188,20 +197,31 @@ def download_liked(session_id: str, download_dir: str, hq: bool = False):
                     save_downloaded_id(downloaded_index_path, track_id)
                     downloaded_ids.add(track_id)
 
-    futures = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for i, track_short in enumerate(likes.tracks, 1):
-            futures.append(executor.submit(process_track, i, track_short))
+    def run_pool(items: list[tuple[int, object]], total: int, is_retry: bool) -> None:
+        futures = []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            for i, track_short in items:
+                futures.append(executor.submit(process_track, i, track_short, total, is_retry))
 
-        try:
-            for future in as_completed(futures):
-                future.result()
-        except KeyboardInterrupt:
-            print("\nОстановка по Ctrl+C. Завершаю активные задачи...")
-            for future in futures:
-                future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except KeyboardInterrupt:
+                print("\nОстановка по Ctrl+C. Завершаю активные задачи...")
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+
+    # Основной проход
+    run_pool(list(enumerate(likes.tracks, 1)), total_tracks, is_retry=False)
+
+    # Повторный проход по неудавшимся
+    if failed_tracks:
+        print(f"\nПовторная попытка для {len(failed_tracks)} треков...")
+        retry_items = list(enumerate([t for _, t in failed_tracks], 1))
+        run_pool(retry_items, len(retry_items), is_retry=True)
+        print("Повторный проход завершён.")
 
 
 if __name__ == "__main__":
