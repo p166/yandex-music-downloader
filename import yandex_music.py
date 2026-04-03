@@ -4,6 +4,12 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+from mutagen.id3 import (
+    ID3, ID3NoHeaderError,
+    TIT2, TPE1, TALB, TDRC, TCON, TRCK, TPOS, APIC,
+)
+
 
 def load_dotenv(dotenv_path: str = ".env") -> None:
     if not os.path.exists(dotenv_path):
@@ -28,7 +34,7 @@ load_dotenv()
 YOUR_SESSION_ID = os.getenv("YANDEX_MUSIC_SESSION_ID", "")
 
 DOWNLOAD_DIR = "./yandex_music_downloads"  # папка, куда будут лежать mp3
-HQ = False  # True — высокое качество, False — стандартное
+HQ = True  # True — высокое качество, False — стандартное
 MAX_WORKERS = 4  # число параллельных загрузок
 
 # https://github.com/MarshalX/yandex-music-api/discussions/513#discussioncomment-2729781
@@ -67,6 +73,51 @@ def get_artists(track) -> str:
         artist.name for artist in (track.artists or []) if getattr(artist, "name", None)
     )
     return artists or "Unknown"
+
+
+def write_id3_tags(fpath: str, track) -> None:
+    try:
+        tags = ID3(fpath)
+    except ID3NoHeaderError:
+        tags = ID3()
+
+    title = track.title or ""
+    if getattr(track, "version", None):
+        title += f" ({track.version})"
+
+    tags["TIT2"] = TIT2(encoding=3, text=title)
+    tags["TPE1"] = TPE1(encoding=3, text=get_artists(track))
+
+    album = (track.albums or [None])[0]
+    if album:
+        if album.title:
+            tags["TALB"] = TALB(encoding=3, text=album.title)
+        if getattr(album, "year", None):
+            tags["TDRC"] = TDRC(encoding=3, text=str(album.year))
+        if getattr(album, "genre", None):
+            tags["TCON"] = TCON(encoding=3, text=album.genre)
+        pos = getattr(album, "track_position", None)
+        if pos:
+            trck = f"{pos.index}/{album.track_count}" if album.track_count else str(pos.index)
+            tags["TRCK"] = TRCK(encoding=3, text=trck)
+            tags["TPOS"] = TPOS(encoding=3, text=str(pos.volume))
+
+    cover_uri = getattr(track, "cover_uri", None)
+    if cover_uri:
+        url = cover_uri.replace("%%", "400x400")
+        if not url.startswith("http"):
+            url = "https://" + url
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.ok:
+                tags["APIC"] = APIC(
+                    encoding=3, mime="image/jpeg", type=3, desc="Cover", data=resp.content
+                )
+        except Exception:
+            pass
+
+    tags.save(fpath)
+
 
 # === МАССОВОЕ СКАЧИВАНИЕ «МНЕ НРАВИТСЯ» ===
 def download_liked(session_id: str, download_dir: str, hq: bool = False):
@@ -125,6 +176,11 @@ def download_liked(session_id: str, download_dir: str, hq: bool = False):
         except Exception as e:
             print(f"[{i}/{total_tracks}] Ошибка скачивания: {e}")
             return
+
+        try:
+            write_id3_tags(fpath, track)
+        except Exception as e:
+            print(f"[{i}/{total_tracks}] Ошибка записи тегов: {e}")
 
         if track_id:
             with ids_lock:

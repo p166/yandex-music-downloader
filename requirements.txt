@@ -1,1 +1,2 @@
 yandex-music==2.2.0
+mutagen>=1.47
