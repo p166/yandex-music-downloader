@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+
+yandex_music_downloads/
+
+.DS_Store
